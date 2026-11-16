@@ -717,8 +717,13 @@ function lexQuote(lines, i, ctx, prot) {
 
 // Would `line` interrupt a paragraph? (Setext underlines do not count:
 // they continue the paragraph by converting it.)
+function isFenceStart(line) {
+  const fm = FENCE_RE.exec(line);
+  return fm !== null && (fm[1][0] === '~' || !fm[2].includes('`'));
+}
+
 function startsInterruptingBlock(line, lines, j, inItem) {
-  if (FENCE_RE.test(line)) return true;
+  if (isFenceStart(line)) return true;
   if (ATX_RE.test(line)) return true;
   if (HR_RE.test(line)) return true;
   if (QUOTE_RE.test(line)) return true;
@@ -824,7 +829,7 @@ function advanceTrack(st, line, inItem) {
 function paraOpenFlat(line, wasOpen) {
   if (isBlank(line)) return false;
   if (leadingCols(line) >= 4) return false;
-  if (FENCE_RE.test(line) || ATX_RE.test(line) || HR_RE.test(line) || QUOTE_RE.test(line)) return false;
+  if (isFenceStart(line) || ATX_RE.test(line) || HR_RE.test(line) || QUOTE_RE.test(line)) return false;
   if (matchListStart(line)) return false;
   if (htmlBlockStart(line)) return false;
   if (scanDef([line], 0)) return false;
@@ -835,7 +840,7 @@ function paraOpenFlat(line, wasOpen) {
 // Would the text after an indented line's first 4 columns start a block?
 function blockStartAfterIndent(line) {
   const rest = stripCols(line, 4);
-  if (FENCE_RE.test(rest) || ATX_RE.test(rest) || HR_RE.test(rest) || QUOTE_RE.test(rest)) return true;
+  if (isFenceStart(rest) || ATX_RE.test(rest) || HR_RE.test(rest) || QUOTE_RE.test(rest)) return true;
   if (matchListStart(rest)) return true;
   if (htmlBlockStart(rest)) return true;
   return false;
@@ -1256,39 +1261,71 @@ function trimAutolink(url) {
 // with an alphanumeric, and the address may not be immediately followed
 // by another domain-ish character (which would make it a longer,
 // invalid address rather than a valid one plus punctuation).
-function matchEmailAddress(s) {
-  const m = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)/.exec(s);
-  if (!m) return null;
-  for (const label of m[1].split('.')) {
-    if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label)) return null;
+function matchEmailAddress(s, underCtx) {
+  const lm = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@/.exec(s);
+  if (!lm) return null;
+  const localLen = lm[0].length;
+  const dm = /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*/.exec(s.slice(localLen));
+  if (!dm) return null;
+  const labels = dm[0].split('.');
+  const labelOk = (l) => /^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$/.test(l);
+  // The longest valid domain wins; trailing labels are dropped until
+  // the domain is valid and the character after it is a boundary. An
+  // email inside a `__` emphasis span still matches in full: marked
+  // lexes the span's content separately, so the closing run is not
+  // "after the domain" there (underCtx reports that situation).
+  for (let k = labels.length; k >= 2; k -= 1) {
+    const cand = labels.slice(0, k);
+    if (!cand.every(labelOk)) continue;
+    const dom = cand.join('.');
+    const after = s[localLen + dom.length];
+    if (after !== undefined && /[A-Za-z0-9_-]/.test(after)) {
+      if (k === labels.length && after === '_' && underCtx) {
+        let m = 0;
+        while (s[localLen + dom.length + m] === '_') m += 1;
+        if (m >= 2 && underCtx(m)) return s.slice(0, localLen) + dom;
+      }
+      continue;
+    }
+    return s.slice(0, localLen) + dom;
   }
-  const after = s[m[0].length];
-  if (after !== undefined && /[A-Za-z0-9_-]/.test(after)) return null;
-  return m[0];
+  return null;
 }
 
 // Try a GFM extended autolink at s[i]: returns {raw, href} or null.
-function matchAutolink(s, i, prevCh) {
+// opts.delims: delimiter runs scanned so far (for the __ email rule);
+// opts.inBracket: inside an open '[' label, where a bare autolink run
+// must stop at a bracket (marked lexes the label atomically).
+function matchAutolink(s, i, prevCh, opts) {
   const rest = s.slice(i);
   const boundary = prevCh === undefined || isWsChar(prevCh) || isPunctChar(prevCh);
+  const underCtx = opts && opts.delims ? (m) => opts.delims.some((e) => e.char === '_' && e.len === m && e.canOpen) : null;
+  const capRun = (run) => {
+    if (!opts || !opts.inBracket) return run;
+    const cut = run.search(/[\[\]]/);
+    return cut === -1 ? run : run.slice(0, cut);
+  };
   let m = /^(?:https?|ftp):\/\/[^\s<>]+/i.exec(rest);
   if (m && boundary) {
-    const raw = trimAutolink(m[0]);
+    const raw = trimAutolink(capRun(m[0]));
     if (raw.length <= m[0].indexOf('://') + 3) return null;
     return { raw, href: raw };
   }
   if ((rest.startsWith('www.') || rest.startsWith('WWW.')) && boundary) {
     m = /^www\.[^\s<>]+/i.exec(rest);
-    if (m && m[0].includes('.', 4)) {
-      const raw = trimAutolink(m[0]);
-      if (raw.length > 4) return { raw, href: 'http://' + raw };
+    if (m) {
+      const capped = capRun(m[0]);
+      if (capped.includes('.', 4)) {
+        const raw = trimAutolink(capped);
+        if (raw.length > 4) return { raw, href: 'http://' + raw };
+      }
     }
     return null;
   }
   if (boundary) {
     const sm = /^(mailto:|xmpp:)/i.exec(rest);
     if (sm) {
-      const em = matchEmailAddress(rest.slice(sm[0].length));
+      const em = matchEmailAddress(rest.slice(sm[0].length), underCtx);
       if (!em) return null;
       let raw = sm[0] + em;
       if (sm[1].toLowerCase() === 'xmpp:') {
@@ -1299,7 +1336,7 @@ function matchAutolink(s, i, prevCh) {
     }
   }
   if (prevCh === undefined || !(/[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~@-]/.test(prevCh))) {
-    const em = matchEmailAddress(rest);
+    const em = matchEmailAddress(rest, underCtx);
     if (em) return { raw: em, href: 'mailto:' + em };
   }
   return null;
@@ -1570,7 +1607,7 @@ function renderInline(src, ctx, inLink) {
     }
     if (!inLink && !ctx.state.inLink && (c === 'h' || c === 'H' || c === 'w' || c === 'W' || c === 'f' || c === 'F' || /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(c))) {
       const prevCh = i > 0 ? src[i - 1] : undefined;
-      const al = matchAutolink(src, i, prevCh);
+      const al = matchAutolink(src, i, prevCh, { delims, inBracket: brackets.length > 0 });
       if (al) {
         const attr = hrefAttr(al.href);
         flushText();
@@ -1602,14 +1639,23 @@ function processDelims(delims) {
       const op = delims[k];
       if (op.dead > 0) {
         // A dead entry: the ghost of a delimiter pair whose closer could
-        // also open. It absorbs later closers without forming anything:
-        // a closer no longer than it is blocked outright (and wears it
-        // down); a longer one pays dead-1 stars (which will render
-        // inside any wrap it goes on to form) and passes.
+        // also open. A later closer passes it by paying dead-1 stars,
+        // provided it can still fully consume the nearest opener below
+        // afterwards; otherwise it is blocked and wears the entry down.
         if (op.char !== closer.char) continue;
-        if (closer.len > op.dead) {
-          closer.pre += op.dead - 1;
-          closer.len -= op.dead - 1;
+        let below = null;
+        for (let m = k - 1; m > bottom; m -= 1) {
+          const q = delims[m];
+          if (q.dead === 0 && q.char === closer.char && q.canOpen && q.len > 0) { below = q; break; }
+        }
+        let pay = -1;
+        if (closer.len > op.dead) pay = op.dead - 1;
+        else if (below && below.len <= closer.len && (below.len < closer.len || closer.len < op.dead)) {
+          pay = Math.min(op.dead - 1, closer.len - below.len);
+        }
+        if (pay >= 0) {
+          closer.pre += pay;
+          closer.len -= pay;
           op.dead = 0;
           continue;
         }
@@ -1645,14 +1691,15 @@ function processDelims(delims) {
     op.len -= use;
     closer.len -= use;
     op.node.text = op.node.text.slice(0, op.node.text.length - use);
-    if (closer.pre > 0) {
-      // Stars spent passing a dead entry render inside the wrap.
+    if (closer.pre > 0 && use === 2) {
+      // Stars spent passing a dead entry render inside a strong wrap;
+      // for an em wrap they render after it instead.
       const preNode = { kind: 'text', text: closer.char.repeat(closer.pre), prev: closer.node.prev, next: closer.node };
       if (closer.node.prev) closer.node.prev.next = preNode;
       closer.node.prev = preNode;
-      closer.pre = 0;
     }
-    closer.node.text = closer.char.repeat(closer.len);
+    closer.node.text = closer.char.repeat(closer.len + (use === 1 ? closer.pre : 0));
+    closer.pre = 0;
     const tag = closer.char === '~' ? 'del' : use === 2 ? 'strong' : 'em';
     wrapNodes(op.node, closer.node, tag);
     if (closer.len === 0 && closer.canOpen && closer.char !== '~' && !op.canClose && use === 1) {
