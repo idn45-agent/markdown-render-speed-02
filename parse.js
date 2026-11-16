@@ -1271,21 +1271,52 @@ function isPunctChar(ch) {
 const TRAILING_PUNCT = new Set(['?', '!', '.', ',', ':', '*', '_', '~', ';']);
 const ENTITY_TAIL_RE = /&(?:#\d+|#[Xx][0-9A-Fa-f]+|\w+);$/;
 
+// Cut a bare-autolink run at the start of its final unclosed
+// parenthesized group, when that group contains no ')' at all (no
+// inner pair ever closed inside it). A group that does close an
+// inner pair keeps the whole run.
+function cutUnclosedGroup(run) {
+  let depth = 0;
+  let groupStart = -1;
+  let groupHasClose = false;
+  for (let i = 0; i < run.length; i += 1) {
+    const c = run[i];
+    if (c === '(') {
+      if (depth === 0) { groupStart = i; groupHasClose = false; }
+      depth += 1;
+    } else if (c === ')') {
+      if (depth > 0) {
+        depth -= 1;
+        if (depth === 0) groupStart = -1;
+        else groupHasClose = true;
+      }
+    }
+  }
+  if (groupStart !== -1 && !groupHasClose) return run.slice(0, groupStart);
+  return run;
+}
+
 function trimAutolink(url) {
   let u = url;
   for (;;) {
     const before = u;
     u = u.replace(ENTITY_TAIL_RE, '');
     while (u.length && TRAILING_PUNCT.has(u[u.length - 1])) u = u.slice(0, -1);
-    let opens = 0;
-    let closes = 0;
-    for (const ch of u) {
-      if (ch === '(') opens += 1;
-      else if (ch === ')') closes += 1;
-    }
-    while (u.endsWith(')') && closes > opens) {
-      u = u.slice(0, -1);
-      closes -= 1;
+    // A trailing ')' is dropped when it is unmatched, or when the
+    // group it closes itself contains a '(' (a nested group).
+    while (u.endsWith(')')) {
+      let depth = 0;
+      let matchPos = -1;
+      for (let j = u.length - 2; j >= 0; j -= 1) {
+        if (u[j] === ')') depth += 1;
+        else if (u[j] === '(') {
+          if (depth === 0) { matchPos = j; break; }
+          depth -= 1;
+        }
+      }
+      if (matchPos === -1) { u = u.slice(0, -1); continue; }
+      if (u.slice(matchPos + 1, -1).includes('(')) { u = u.slice(0, -1); continue; }
+      break;
     }
     if (u === before) return u;
   }
@@ -1353,7 +1384,7 @@ function matchAutolink(s, i, prevCh, opts) {
   };
   let m = /^(?:https?|ftp):\/\/[^\s<>]+/i.exec(rest);
   if (m && boundary) {
-    const raw = trimAutolink(capRun(m[0]));
+    const raw = trimAutolink(cutUnclosedGroup(capRun(m[0])));
     if (raw.length <= m[0].indexOf('://') + 3) return null;
     return { raw, href: raw };
   }
@@ -1362,7 +1393,7 @@ function matchAutolink(s, i, prevCh, opts) {
     if (m) {
       const capped = capRun(m[0]);
       if (capped.includes('.', 4)) {
-        const raw = trimAutolink(capped);
+        const raw = trimAutolink(cutUnclosedGroup(capped));
         if (raw.length > 4) return { raw, href: 'http://' + raw };
       }
     }
