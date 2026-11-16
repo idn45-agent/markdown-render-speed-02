@@ -966,7 +966,10 @@ function lexList(lines, i, ctx, prot) {
         if (itemHasContent && leadingCols(nl) >= ci) {
           for (let b = k; b < m; b += 1) { itemLines.push(''); itemSrc.push(b); advanceTrack(itemSt, '', true); }
           itemOwnParaOpen = false;
-          itemNestedList = false;
+          // A nested list survives a blank when the content after it
+          // is still indented into the nested list's range; only a
+          // return to this item's own level ends it.
+          if (leadingCols(stripContainer(nl, ci)) < 2) itemNestedList = false;
           itemQuotePara = false;
           itemFenceLive = false;
           k = m;
@@ -1002,9 +1005,6 @@ function lexList(lines, i, ctx, prot) {
         if (!tabLine && tabLineIdx !== -1) {
           if (itemLines.length - 1 === tabLineIdx) itemLines[tabLineIdx] += '\n';
           tabLineIdx = -1;
-        }
-        if (!tabLine && !itemSt.fence && itemOwnParaOpen && leadingCols(stripped) >= 4 && !blockStartAfterIndent(stripped)) {
-          stripped = stripCols(stripped, 4);
         }
         itemLines.push(stripped);
         itemSrc.push(k);
