@@ -1379,6 +1379,38 @@ function matchAutolink(s, i, prevCh, opts) {
   return null;
 }
 
+// The lengths of the backtick runs in a raw label text, skipping
+// backslash-escaped characters.
+function backtickRuns(text) {
+  const runs = [];
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === '\\') { i += 2; continue; }
+    if (text[i] === '`') {
+      let run = 1;
+      while (text[i + run] === '`') run += 1;
+      runs.push(run);
+      i += run;
+      continue;
+    }
+    i += 1;
+  }
+  return runs;
+}
+
+// Whether marked's link extraction accepts a label containing
+// backtick runs. Empirically (probed against marked 18.1.3): a label
+// is rejected when it contains an odd number of backtick runs and
+// either the last run has length 1 or some text follows the last
+// run inside the label. A trailing run of length >= 2 at the very
+// end of the label is absorbed.
+function labelIsValid(label) {
+  const runs = backtickRuns(label);
+  if (runs.length % 2 === 0) return true;
+  const last = runs[runs.length - 1];
+  return last >= 2 && label.endsWith('`');
+}
+
 function renderInline(src, ctx, inLink) {
   let head = null;
   let tail = null;
@@ -1407,11 +1439,55 @@ function renderInline(src, ctx, inLink) {
   // text nodes first; a ']' tries to form a link/image with the most
   // recent opener. A formed link deactivates all earlier link openers.
   const brackets = [];
+  // marked masks the regions between exactly-paired backtick runs
+  // over the whole paragraph text (regardless of token boundaries):
+  // emphasis/strikethrough delimiters inside such a region are
+  // inert. The pairing is greedy: a run opens a region and the next
+  // run of exactly the same length closes it.
+  const maskRegions = [];
+  {
+    let openPos = -1;
+    let openLen = 0;
+    let k = 0;
+    while (k < src.length) {
+      if (src[k] === '\\') { k += 2; continue; }
+      if (src[k] === '`') {
+        let run = 1;
+        while (src[k + run] === '`') run += 1;
+        if (openPos === -1) { openPos = k; openLen = run; }
+        else if (run === openLen) { maskRegions.push([openPos, k + run]); openPos = -1; }
+        k += run;
+        continue;
+      }
+      k += 1;
+    }
+  }
+  const inMask = (pos) => {
+    for (const [a, b] of maskRegions) {
+      if (pos > a && pos < b) return true;
+      if (a > pos) break;
+    }
+    return false;
+  };
+  const popBracket = () => {
+    const popped = brackets.pop();
+    if (popped && popped.touched && brackets.length) {
+      brackets[brackets.length - 1].lspan = popped.lspan;
+      brackets[brackets.length - 1].touched = true;
+    }
+    return popped;
+  };
   const closeBracket = (closeIdx) => {
     if (!brackets.length) return -1;
     const opener = brackets[brackets.length - 1];
     if (!opener.active) {
-      brackets.pop();
+      popBracket();
+      return -1;
+    }
+    if (!labelIsValid(src.slice(opener.contentStart, closeIdx))) {
+      // marked's label extraction rejects this label (see
+      // labelIsValid), so the ']' stays literal text.
+      popBracket();
       return -1;
     }
     const label = src.slice(opener.contentStart, closeIdx);
@@ -1456,7 +1532,7 @@ function renderInline(src, ctx, inLink) {
       }
     }
     if (consumed === -1) {
-      brackets.pop();
+      popBracket();
       return -1;
     }
     flushText();
@@ -1477,7 +1553,7 @@ function renderInline(src, ctx, inLink) {
     if (before) before.next = null;
     else head = null;
     tail = before;
-    brackets.pop();
+    popBracket();
     const attr = hrefAttr(href);
     if (opener.isImage) {
       const plain = innerHead ? plainTextOfNodes(innerHead) : '';
@@ -1525,21 +1601,45 @@ function renderInline(src, ctx, inLink) {
     if (c === '`') {
       let run = 1;
       while (src[i + run] === '`') run += 1;
+      const topBr = brackets.length ? brackets[brackets.length - 1] : null;
+      const inLabel = topBr !== null && topBr.active;
+      // Register this run in the top label's extraction pairing: a
+      // run opens a span, and a run of length <= the open run's
+      // length closes it. The state decides whether a ']' further
+      // along is hidden inside such a span (see closeBracket).
+      let lspanAfter = 0;
+      if (inLabel) {
+        topBr.touched = true;
+        if (topBr.lspan === 0) lspanAfter = run;
+        else if (run <= topBr.lspan) lspanAfter = 0;
+        else lspanAfter = topBr.lspan;
+      }
       let j = i + run;
       let found = -1;
+      let lstate = lspanAfter;
       while (j < n) {
         if (src[j] === '`') {
           let m2 = 1;
           while (src[j + m2] === '`') m2 += 1;
+          if (inLabel) {
+            if (lstate === 0) lstate = m2;
+            else if (m2 <= lstate) lstate = 0;
+          }
           if (m2 === run) { found = j; break; }
           j += m2;
+        } else if (src[j] === ']' && inLabel && lstate === 0) {
+          // The label ends before any span closes: the code span
+          // search is confined to the label.
+          break;
         } else j += 1;
       }
       if (found === -1) {
+        if (inLabel) topBr.lspan = lspanAfter;
         textBuf += '`'.repeat(run);
         i += run;
         continue;
       }
+      if (inLabel) topBr.lspan = lstate;
       let content = src.slice(i + run, found).replace(/\n/g, ' ');
       if (content.length >= 2 && content[0] === ' ' && content[content.length - 1] === ' ' && /[^ ]/.test(content)) {
         content = content.slice(1, -1);
@@ -1584,7 +1684,7 @@ function renderInline(src, ctx, inLink) {
       const isImg = c === '!';
       flushText();
       const node = appendNode({ kind: 'text', text: isImg ? '![' : '[', delim: false, opener: true });
-      brackets.push({ node, isImage: isImg, contentStart: i + (isImg ? 2 : 1), delimIdx: delims.length, active: true });
+      brackets.push({ node, isImage: isImg, contentStart: i + (isImg ? 2 : 1), delimIdx: delims.length, active: true, lspan: 0, touched: false });
       i += isImg ? 2 : 1;
       continue;
     }
@@ -1601,6 +1701,13 @@ function renderInline(src, ctx, inLink) {
     if (c === '*' || c === '_' || c === '~') {
       let run = 1;
       while (src[i + run] === c) run += 1;
+      if (inMask(i)) {
+        // Inside a masked backtick region (see maskRegions above),
+        // delimiters are inert text.
+        textBuf += c.repeat(run);
+        i += run;
+        continue;
+      }
       if (c === '~' && run > 2) {
         textBuf += '~'.repeat(run);
         i += run;
@@ -1644,7 +1751,7 @@ function renderInline(src, ctx, inLink) {
     }
     if (!inLink && !ctx.state.inLink && (c === 'h' || c === 'H' || c === 'w' || c === 'W' || c === 'f' || c === 'F' || /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(c))) {
       const prevCh = i > 0 ? src[i - 1] : undefined;
-      const al = matchAutolink(src, i, prevCh, { delims, inBracket: brackets.length > 0 });
+      const al = matchAutolink(src, i, prevCh, { delims, inBracket: brackets.length > 0 && brackets[brackets.length - 1].active });
       if (al) {
         const attr = hrefAttr(al.href);
         flushText();
@@ -1672,8 +1779,10 @@ function processDelims(delims) {
     const bottom = openersBottom.has(key) ? openersBottom.get(key) : -1;
     let oi = -1;
     let blocked = false;
+    let glueSeen = false;
     for (let k = ci - 1; k > bottom; k -= 1) {
       const op = delims[k];
+      if (op.glue && op.char === closer.char) { glueSeen = true; continue; }
       if (op.dead > 0) {
         // A dead entry: the ghost of a delimiter pair whose closer could
         // also open. A later closer passes it by paying dead-1 stars,
@@ -1707,6 +1816,12 @@ function processDelims(delims) {
         break;
       }
       if ((closer.canOpen || op.canClose) && (op.len + closer.len) % 3 === 0 && !(op.len % 3 === 0 && closer.len % 3 === 0)) continue;
+      // A strong pair whose closer could also open (against an opener
+      // that could not close) poisons a later single-star match across
+      // it: marked's scan produces no em there. The search continues
+      // past the poisoned opener: a strong match further down still
+      // forms.
+      if (glueSeen && !(op.len >= 2 && closer.len >= 2)) continue;
       oi = k;
       break;
     }
@@ -1739,6 +1854,7 @@ function processDelims(delims) {
     closer.pre = 0;
     const tag = closer.char === '~' ? 'del' : use === 2 ? 'strong' : 'em';
     wrapNodes(op.node, closer.node, tag);
+    if (use === 2 && closer.len === 0 && closer.canOpen && !op.canClose) closer.glue = true;
     if (closer.len === 0 && closer.canOpen && closer.char !== '~' && !op.canClose && use === 1) {
       // A fully consumed single-star closer that could also open,
       // matched against an opener that could not close, leaves a dead
