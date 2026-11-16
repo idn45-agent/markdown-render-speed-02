@@ -80,6 +80,25 @@ function stripCols(line, n) {
 // tab stop, column 4) from a line; if the leading whitespace run does not
 // reach column 4 the line is returned unchanged. Used for the first lazy
 // line of a blockquote paragraph.
+// Does the line's leading whitespace contain a tab that ends past
+// column n (i.e. the strip of n columns would cut through it or
+// leave it in the remainder's indent)?
+function isTabIndentedLine(line, n) {
+  let col = 0;
+  for (let p = 0; p < line.length; p += 1) {
+    const ch = line[p];
+    if (ch === ' ') { col += 1; continue; }
+    if (ch === '\t') {
+      const end = col + (4 - (col % 4));
+      if (end > n) return true;
+      col = end;
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
 function stripTabUnit(line) {
   let col = 0;
   let i = 0;
@@ -902,6 +921,13 @@ function lexList(lines, i, ctx, prot) {
     // a content line, with no blank line since. Only a live fence
     // pulls in following unindented lines as content.
     let itemFenceLive = false;
+    // Index in itemLines of the last "tab line" (see the >= ci branch):
+    // when a run of tab lines ends, that line's text gains a trailing
+    // newline (marked renders a phantom blank inside the paragraph).
+    // The rule only applies to the item's own-level paragraph: once a
+    // nested list starts, plain lines belong to it, not to this item.
+    let tabLineIdx = -1;
+    let itemNestedList = false;
     if (ms.rest !== '') advanceTrack(itemSt, ms.rest, true);
     let itemOwnParaOpen = ms.rest !== '' && paraOpenFlat(ms.rest, false);
     let itemQuotePara = QUOTE_RE.test(ms.rest) ? paraOpenAfter(quoteStrip(ms.rest), false, false) : false;
@@ -920,6 +946,7 @@ function lexList(lines, i, ctx, prot) {
         if (itemHasContent && leadingCols(nl) >= ci) {
           for (let b = k; b < m; b += 1) { itemLines.push(''); itemSrc.push(b); advanceTrack(itemSt, '', true); }
           itemOwnParaOpen = false;
+          itemNestedList = false;
           itemQuotePara = false;
           itemFenceLive = false;
           k = m;
@@ -937,17 +964,37 @@ function lexList(lines, i, ctx, prot) {
         break;
       }
       if (leadingCols(line) >= ci) {
+        // A "tab line": the line's leading whitespace holds a tab that
+        // the content-indent strip does not consume exactly (it ends
+        // past the strip), while the item's own paragraph is open.
+        // Marked renders such a line with its whole indent removed,
+        // and the last line of a tab-line run carries an extra
+        // trailing newline in the paragraph text.
         let stripped = stripContainer(line, ci);
-        if (!itemSt.fence && itemOwnParaOpen && leadingCols(stripped) >= 4 && !blockStartAfterIndent(stripped)) {
+        let tabLine = false;
+        if (!itemSt.fence && itemOwnParaOpen && !itemNestedList && isTabIndentedLine(line, ci)) {
+          const content = line.replace(/^[ \t]+/, '');
+          if (!matchListStart(content) && !isFenceStart(content)) {
+            tabLine = true;
+            stripped = content;
+          }
+        }
+        if (!tabLine && tabLineIdx !== -1) {
+          if (itemLines.length - 1 === tabLineIdx) itemLines[tabLineIdx] += '\n';
+          tabLineIdx = -1;
+        }
+        if (!tabLine && !itemSt.fence && itemOwnParaOpen && leadingCols(stripped) >= 4 && !blockStartAfterIndent(stripped)) {
           stripped = stripCols(stripped, 4);
         }
         itemLines.push(stripped);
         itemSrc.push(k);
+        if (tabLine) tabLineIdx = itemLines.length - 1;
         itemHasContent = true;
         const wasFence = itemSt.fence !== null;
         advanceTrack(itemSt, stripped, true);
         itemFenceLive = itemSt.fence ? wasFence : false;
         itemOwnParaOpen = itemSt.fence ? false : paraOpenFlat(stripped, itemOwnParaOpen);
+        if (matchListStart(stripped)) itemNestedList = true;
         if (QUOTE_RE.test(stripped)) itemQuotePara = paraOpenAfter(quoteStrip(stripped), false, false);
         else if (!(itemQuotePara && !startsInterruptingBlock(stripped, [stripped], 0))) itemQuotePara = false;
         k += 1;
@@ -981,6 +1028,10 @@ function lexList(lines, i, ctx, prot) {
         continue;
       }
       if (itemSt.open && !startsInterruptingBlock(line, lines, k)) {
+        if (tabLineIdx !== -1) {
+          if (itemLines.length - 1 === tabLineIdx) itemLines[tabLineIdx] += '\n';
+          tabLineIdx = -1;
+        }
         itemLines.push(stripTabUnit(line)); // lazy continuation
         itemSrc.push(k);
         itemLazy.add(itemLines.length - 1);
