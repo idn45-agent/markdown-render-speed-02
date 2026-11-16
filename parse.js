@@ -1366,7 +1366,7 @@ function matchEmailAddress(s, underCtx) {
         underTried = true;
         let m = 0;
         while (s[localLen + dom.length + m] === '_') m += 1;
-        if (m >= 2 && underCtx(m)) return s.slice(0, localLen) + dom;
+        if (m >= 1 && underCtx(m)) return s.slice(0, localLen) + dom;
       }
       continue;
     }
@@ -1418,7 +1418,16 @@ function matchAutolink(s, i, prevCh, opts) {
       return { raw: trimAutolink(raw), href: raw };
     }
   }
-  if (prevCh === undefined || !(/[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~@-]/.test(prevCh))) {
+  // A bare email may not be preceded by an email character (it would
+  // be the tail of a longer address) — except a '_' run that starts a
+  // word, which marked has already claimed as an emphasis delimiter.
+  let emailBlocked = prevCh !== undefined && /[A-Za-z0-9.!#$%&'*+\/=?^`{|}~@-]/.test(prevCh);
+  if (!emailBlocked && prevCh === '_') {
+    let j = i - 1;
+    while (j >= 0 && s[j] === '_') j -= 1;
+    if (j >= 0 && /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(s[j])) emailBlocked = true;
+  }
+  if (!emailBlocked) {
     const em = matchEmailAddress(rest, underCtx);
     if (em) return { raw: em, href: 'mailto:' + em };
   }
@@ -1492,20 +1501,33 @@ function renderInline(src, ctx, inLink) {
   // run of exactly the same length closes it.
   const maskRegions = [];
   {
-    let openPos = -1;
-    let openLen = 0;
+    // Collect the backtick runs first: an opener that finds no
+    // exact-length closing run is simply skipped, and pairing resumes
+    // at the next run (it does not swallow the rest of the text).
+    const runs = [];
     let k = 0;
     while (k < src.length) {
       if (src[k] === '\\') { k += 2; continue; }
       if (src[k] === '`') {
         let run = 1;
         while (src[k + run] === '`') run += 1;
-        if (openPos === -1) { openPos = k; openLen = run; }
-        else if (run === openLen) { maskRegions.push([openPos, k + run]); openPos = -1; }
+        runs.push([k, run]);
         k += run;
         continue;
       }
       k += 1;
+    }
+    let ri = 0;
+    while (ri < runs.length) {
+      const [openPos, openLen] = runs[ri];
+      let rj = ri + 1;
+      while (rj < runs.length && runs[rj][1] !== openLen) rj += 1;
+      if (rj < runs.length) {
+        maskRegions.push([openPos, runs[rj][0] + openLen]);
+        ri = rj + 1;
+      } else {
+        ri += 1;
+      }
     }
   }
   const inMask = (pos) => {
@@ -1619,6 +1641,7 @@ function renderInline(src, ctx, inLink) {
     }
     flushText();
     const inside = delims.splice(opener.delimIdx);
+    for (const d of inside) d.masked = false;
     processDelims(inside);
     if (!opener.isImage) {
       // Bare autolinks do not form inside link text: unwrap them,
@@ -1787,13 +1810,6 @@ function renderInline(src, ctx, inLink) {
     if (c === '*' || c === '_' || c === '~') {
       let run = 1;
       while (src[i + run] === c) run += 1;
-      if (inMask(i)) {
-        // Inside a masked backtick region (see maskRegions above),
-        // delimiters are inert text.
-        textBuf += c.repeat(run);
-        i += run;
-        continue;
-      }
       if (c === '~' && run > 2) {
         textBuf += '~'.repeat(run);
         i += run;
@@ -1819,7 +1835,11 @@ function renderInline(src, ctx, inLink) {
           canClose = rightFlank && (!leftFlank || isPunctChar(nextCh));
         }
       }
-      delims.push({ node, char: c, len: run, fullLen: run, skip: 0, nextCh, canOpen, canClose, dead: 0, pre: 0, done: false });
+      // A run inside a masked backtick region (see maskRegions above)
+      // is inert in the paragraph's own delimiter processing — but a
+      // link label is lexed by marked on its own, so the flag is
+      // cleared for the entries a formed link splices out.
+      delims.push({ node, char: c, len: run, fullLen: run, skip: 0, nextCh, canOpen, canClose, dead: 0, pre: 0, done: false, masked: inMask(i) });
       i += run;
       continue;
     }
@@ -1860,7 +1880,7 @@ function processDelims(delims) {
   let ci = 0;
   while (ci < delims.length) {
     const closer = delims[ci];
-    if (!closer.canClose || closer.len === 0 || closer.dead > 0) { ci += 1; continue; }
+    if (!closer.canClose || closer.len === 0 || closer.dead > 0 || closer.masked) { ci += 1; continue; }
     const key = closer.char + '|' + (closer.len % 3) + '|' + (closer.canOpen ? '1' : '0');
     const bottom = openersBottom.has(key) ? openersBottom.get(key) : -1;
     let oi = -1;
@@ -1878,7 +1898,7 @@ function processDelims(delims) {
         let below = null;
         for (let m = k - 1; m > bottom; m -= 1) {
           const q = delims[m];
-          if (q.dead === 0 && q.char === closer.char && q.canOpen && q.len > 0) { below = q; break; }
+          if (q.dead === 0 && q.char === closer.char && q.canOpen && q.len > 0 && !q.masked) { below = q; break; }
         }
         let pay = -1;
         if (closer.len > op.dead) pay = op.dead - 1;
@@ -1895,7 +1915,7 @@ function processDelims(delims) {
         blocked = true;
         break;
       }
-      if (op.char !== closer.char || !op.canOpen || op.len === 0) continue;
+      if (op.char !== closer.char || !op.canOpen || op.len === 0 || op.masked) continue;
       if (closer.char === '~') {
         if (op.len !== closer.len) continue;
         oi = k;
