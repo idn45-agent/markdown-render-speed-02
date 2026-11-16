@@ -47,7 +47,7 @@ function leadingCols(line) {
 }
 
 // Remove up to n columns of leading whitespace from a line. A tab that
-// straddles the cut leaves its remaining width as spaces. Returns the rest
+// straddles the cut is dropped whole. Returns the rest
 // of the line (the whole line when it has fewer than n columns and is not
 // all whitespace: then the columns actually present are removed only when
 // the line is blank).
@@ -65,8 +65,9 @@ function stripCols(line, n) {
         col += w;
         i += 1;
       } else {
-        // partially consumed tab: remainder becomes spaces
-        return ' '.repeat(col + w - n) + line.slice(i + 1);
+        // A tab straddling the cut is dropped whole (marked's fence
+        // content stripping does not leave its remainder as spaces).
+        return line.slice(i + 1);
       }
     } else {
       break;
@@ -407,32 +408,26 @@ function splitRow(line) {
       continue;
     }
     if (c === '`') {
-      let run = 0;
-      while (line[i] === '`') {
-        run += 1;
+      // A code span protects the pipes inside it. marked's cell
+      // splitter finds spans the way its codespan regex does: try
+      // opening runs from longest to shortest, the closing string is
+      // the next occurrence of the same backtick string, and the
+      // content must be non-empty; on failure a single backtick is
+      // literal and scanning resumes at the next one.
+      let run = 1;
+      while (line[i + run] === '`') run += 1;
+      let end = -1;
+      for (let open = run; open >= 1 && end === -1; open -= 1) {
+        const ticks = '`'.repeat(open);
+        const close = line.indexOf(ticks, i + open + 1);
+        if (close !== -1) end = close + open;
+      }
+      if (end === -1) {
+        cur += '`';
         i += 1;
-      }
-      // A code span protects the pipes inside it, but only when a
-      // closing run of the same length exists later in the row;
-      // otherwise the backticks are literal text.
-      let j = i;
-      let closeEnd = -1;
-      while (j < line.length) {
-        if (line[j] === '\\' && j + 1 < line.length) { j += 2; continue; }
-        if (line[j] === '`') {
-          let r2 = 0;
-          while (line[j] === '`') { r2 += 1; j += 1; }
-          if (r2 === run) { closeEnd = j; break; }
-          continue;
-        }
-        j += 1;
-      }
-      if (closeEnd === -1) {
-        cur += '`'.repeat(run);
       } else {
-        let seg = '`'.repeat(run);
+        let seg = '';
         let k = i;
-        const end = closeEnd - run;
         while (k < end) {
           if (line[k] === '\\' && k + 1 < end) {
             seg += line[k + 1] === '|' ? '|' : line[k] + line[k + 1];
@@ -442,9 +437,8 @@ function splitRow(line) {
           seg += line[k];
           k += 1;
         }
-        seg += '`'.repeat(run);
         cur += seg;
-        i = closeEnd;
+        i = end;
       }
       continue;
     }
@@ -898,6 +892,10 @@ function lexList(lines, i, ctx, prot) {
     const itemSrc = [j];
     const itemLazy = new Set();
     const itemSt = { open: false, fence: null };
+    // Whether the item's open fence is "live": it has already taken
+    // a content line, with no blank line since. Only a live fence
+    // pulls in following unindented lines as content.
+    let itemFenceLive = false;
     if (ms.rest !== '') advanceTrack(itemSt, ms.rest, true);
     let itemOwnParaOpen = ms.rest !== '' && paraOpenFlat(ms.rest, false);
     let itemQuotePara = QUOTE_RE.test(ms.rest) ? paraOpenAfter(quoteStrip(ms.rest), false, false) : false;
@@ -917,6 +915,7 @@ function lexList(lines, i, ctx, prot) {
           for (let b = k; b < m; b += 1) { itemLines.push(''); itemSrc.push(b); advanceTrack(itemSt, '', true); }
           itemOwnParaOpen = false;
           itemQuotePara = false;
+          itemFenceLive = false;
           k = m;
           continue;
         }
@@ -939,7 +938,9 @@ function lexList(lines, i, ctx, prot) {
         itemLines.push(stripped);
         itemSrc.push(k);
         itemHasContent = true;
+        const wasFence = itemSt.fence !== null;
         advanceTrack(itemSt, stripped, true);
+        itemFenceLive = itemSt.fence ? wasFence : false;
         itemOwnParaOpen = itemSt.fence ? false : paraOpenFlat(stripped, itemOwnParaOpen);
         if (QUOTE_RE.test(stripped)) itemQuotePara = paraOpenAfter(quoteStrip(stripped), false, false);
         else if (!(itemQuotePara && !startsInterruptingBlock(stripped, [stripped], 0))) itemQuotePara = false;
@@ -947,9 +948,13 @@ function lexList(lines, i, ctx, prot) {
         continue;
       }
       if (itemSt.fence) {
-        // An unmarked line while the item's own fence is open is fence
-        // content — except the closing fence, which is not the item's.
+        // An unindented line while the item's fence is open is fence
+        // content only when the fence is live (it already took a
+        // content line with no blank since); a fence-close line is
+        // never the item's. Otherwise the item ends here and the
+        // fence keeps the content it had.
         if (isFenceClose(line, itemSt.fence)) { end = k; break; }
+        if (!itemFenceLive) { end = k; break; }
         itemLines.push(line);
         itemSrc.push(k);
         itemHasContent = true;
@@ -1306,11 +1311,15 @@ function matchEmailAddress(s, underCtx) {
   const bases = [dm[0]];
   const trimmedBase = dm[0].replace(/[_-]+$/, '');
   if (trimmedBase !== dm[0] && trimmedBase.includes('.')) bases.push(trimmedBase);
-  const candidates = [];
+  // All label-prefixes of all bases, longest first: a longer valid
+  // domain (e.g. the trimmed full domain) must win over a shorter
+  // prefix that happens to end at a '.' boundary.
+  const candSet = new Set();
   for (const base of bases) {
     const bl = base.split('.');
-    for (let k = bl.length; k >= 2; k -= 1) candidates.push(bl.slice(0, k).join('.'));
+    for (let k = bl.length; k >= 2; k -= 1) candSet.add(bl.slice(0, k).join('.'));
   }
+  const candidates = [...candSet].sort((a, b) => b.length - a.length);
   let underTried = false;
   for (const dom of candidates) {
     if (!dom.split('.').every(labelOk)) continue;
