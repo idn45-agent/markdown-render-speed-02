@@ -394,7 +394,6 @@ function splitRow(line) {
   const cells = [];
   let cur = '';
   let i = 0;
-  let inCode = 0; // backtick run length currently open, 0 = none
   while (i < line.length) {
     const c = line[i];
     if (c === '\\' && i + 1 < line.length) {
@@ -413,12 +412,43 @@ function splitRow(line) {
         run += 1;
         i += 1;
       }
-      cur += '`'.repeat(run);
-      if (inCode === 0) inCode = run;
-      else if (inCode === run) inCode = 0;
+      // A code span protects the pipes inside it, but only when a
+      // closing run of the same length exists later in the row;
+      // otherwise the backticks are literal text.
+      let j = i;
+      let closeEnd = -1;
+      while (j < line.length) {
+        if (line[j] === '\\' && j + 1 < line.length) { j += 2; continue; }
+        if (line[j] === '`') {
+          let r2 = 0;
+          while (line[j] === '`') { r2 += 1; j += 1; }
+          if (r2 === run) { closeEnd = j; break; }
+          continue;
+        }
+        j += 1;
+      }
+      if (closeEnd === -1) {
+        cur += '`'.repeat(run);
+      } else {
+        let seg = '`'.repeat(run);
+        let k = i;
+        const end = closeEnd - run;
+        while (k < end) {
+          if (line[k] === '\\' && k + 1 < end) {
+            seg += line[k + 1] === '|' ? '|' : line[k] + line[k + 1];
+            k += 2;
+            continue;
+          }
+          seg += line[k];
+          k += 1;
+        }
+        seg += '`'.repeat(run);
+        cur += seg;
+        i = closeEnd;
+      }
       continue;
     }
-    if (c === '|' && inCode === 0) {
+    if (c === '|') {
       cells.push(cur);
       cur = '';
       i += 1;
@@ -1269,18 +1299,25 @@ function matchEmailAddress(s, underCtx) {
   if (!dm) return null;
   const labels = dm[0].split('.');
   const labelOk = (l) => /^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$/.test(l);
-  // The longest valid domain wins; trailing labels are dropped until
-  // the domain is valid and the character after it is a boundary. An
-  // email inside a `__` emphasis span still matches in full: marked
-  // lexes the span's content separately, so the closing run is not
-  // "after the domain" there (underCtx reports that situation).
-  for (let k = labels.length; k >= 2; k -= 1) {
-    const cand = labels.slice(0, k);
-    if (!cand.every(labelOk)) continue;
-    const dom = cand.join('.');
+  // Candidate domains, longest first: the full match, the full match
+  // with trailing [_-] stripped from its last label, then progressively
+  // shorter prefixes. The first label-valid candidate whose following
+  // character is a boundary wins.
+  const bases = [dm[0]];
+  const trimmedBase = dm[0].replace(/[_-]+$/, '');
+  if (trimmedBase !== dm[0] && trimmedBase.includes('.')) bases.push(trimmedBase);
+  const candidates = [];
+  for (const base of bases) {
+    const bl = base.split('.');
+    for (let k = bl.length; k >= 2; k -= 1) candidates.push(bl.slice(0, k).join('.'));
+  }
+  let underTried = false;
+  for (const dom of candidates) {
+    if (!dom.split('.').every(labelOk)) continue;
     const after = s[localLen + dom.length];
     if (after !== undefined && /[A-Za-z0-9_-]/.test(after)) {
-      if (k === labels.length && after === '_' && underCtx) {
+      if (!underTried && after === '_' && underCtx) {
+        underTried = true;
         let m = 0;
         while (s[localLen + dom.length + m] === '_') m += 1;
         if (m >= 2 && underCtx(m)) return s.slice(0, localLen) + dom;
