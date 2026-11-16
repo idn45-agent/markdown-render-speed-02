@@ -29,6 +29,7 @@ function escapeText(s) {
 // Escape with every "&" escaped (code content, attribute values).
 const FULL_ESCAPE_RE = /[&<>"']/g;
 function escapeFull(s) {
+  if (!s.includes('&') && !s.includes('<') && !s.includes('>') && !s.includes('"') && !s.includes("'")) return s;
   return s.replace(FULL_ESCAPE_RE, (c) => ESCAPES[c]);
 }
 
@@ -353,6 +354,8 @@ const QUOTE_RE = /^ {0,3}>[ \t]?/;
 const SETEXT_RE = /^ {0,3}(=+|-+)[ \t]*$/;
 
 function matchListStart(line) {
+  const fc0 = firstContentChar(line);
+  if (fc0 !== '-' && fc0 !== '+' && fc0 !== '*' && !(fc0 >= '0' && fc0 <= '9')) return null;
   const m = /^ {0,3}(?:([-+*])|(\d{1,9})([.)]))([ \t]+|$)/.exec(line);
   if (!m) return null;
   const bullet = m[1] || null;
@@ -386,7 +389,14 @@ function matchListStart(line) {
 // 'pi', 'decl', 'cdata', 'block' or 'tag', or null.
 const BLOCK_TAGS = new Set(('address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li link main menu menuitem nav noframes ol optgroup option p param section source summary table tbody td tfoot th thead title tr track ul').split(' '));
 
+function firstContentChar(line) {
+  let p = 0;
+  while (line[p] === ' ') p += 1;
+  return line[p];
+}
+
 function htmlBlockStart(line, lines, i) {
+  if (firstContentChar(line) !== '<') return null;
   const m = /^ {0,3}<(\/?)([A-Za-z][A-Za-z0-9-]*)((?:[ \t]+[^ \t<>"'/=]+(?:[ \t]*=[ \t]*(?:[^ \t"'=<>`]+|'[^']*'|"[^"]*"))?)*)[ \t]*(\/?)>/.exec(line);
   const stripped = line.replace(/^ {0,3}/, '');
   if (stripped.startsWith('<!--')) return { kind: 'comment' };
@@ -401,8 +411,8 @@ function htmlBlockStart(line, lines, i) {
   if (bm && BLOCK_TAGS.has(bm[1].toLowerCase())) return { kind: 'block' };
   if (m) {
     // Type 7: a complete, well-formed tag with only whitespace after it.
-    const tagText = scanInlineHtml(line.replace(/^ {0,3}/, ''));
-    if (tagText !== null && tagText === m[0].replace(/^ {0,3}/, '') && /^[ \t]*$/.test(line.slice(m[0].length))) return { kind: 'tag' };
+    const tagLen = scanInlineHtml(line.replace(/^ {0,3}/, ''), 0);
+    if (tagLen !== -1 && tagLen === m[0].replace(/^ {0,3}/, '').length && /^[ \t]*$/.test(line.slice(m[0].length))) return { kind: 'tag' };
   }
   return null;
 }
@@ -545,8 +555,9 @@ function lexBlocks(lines, ctx, prot) {
       i = p.next;
       continue;
     }
+    const fc = firstContentChar(line);
     // fenced code
-    const fm = FENCE_RE.exec(line);
+    const fm = (fc === '`' || fc === '~') ? FENCE_RE.exec(line) : null;
     if (fm && (fm[1][0] === '~' || !fm[2].includes('`'))) {
       const ch = fm[1][0];
       const len = fm[1].length;
@@ -598,7 +609,7 @@ function lexBlocks(lines, ctx, prot) {
       continue;
     }
     // ATX heading
-    const hm = ATX_RE.exec(line);
+    const hm = fc === '#' ? ATX_RE.exec(line) : null;
     if (hm) {
       let text = hm[2] === undefined ? '' : hm[2];
       if (/^#+$/.test(text)) text = '';
@@ -608,13 +619,13 @@ function lexBlocks(lines, ctx, prot) {
       continue;
     }
     // thematic break
-    if (HR_RE.test(line)) {
+    if ((fc === '-' || fc === '*' || fc === '_') && HR_RE.test(line)) {
       push({ t: 'hr' });
       i += 1;
       continue;
     }
     // blockquote
-    if (QUOTE_RE.test(line)) {
+    if (fc === '>' && QUOTE_RE.test(line)) {
       const q = lexQuote(lines, i, ctx, prot);
       push(q.token);
       i = q.next;
@@ -636,7 +647,7 @@ function lexBlocks(lines, ctx, prot) {
       continue;
     }
     // link reference definition
-    const def = scanDef(lines, i);
+    const def = fc === '[' ? scanDef(lines, i) : null;
     if (def) {
       const key = defKey(def.label);
       if (!ctx.defs.has(key)) ctx.defs.set(key, { href: def.href, title: def.title });
@@ -767,15 +778,18 @@ function lexQuote(lines, i, ctx, prot) {
 // Would `line` interrupt a paragraph? (Setext underlines do not count:
 // they continue the paragraph by converting it.)
 function isFenceStart(line) {
+  const fc0 = firstContentChar(line);
+  if (fc0 !== '`' && fc0 !== '~') return false;
   const fm = FENCE_RE.exec(line);
   return fm !== null && (fm[1][0] === '~' || !fm[2].includes('`'));
 }
 
 function startsInterruptingBlock(line, lines, j, inItem) {
+  const fc0 = firstContentChar(line);
   if (isFenceStart(line)) return true;
-  if (ATX_RE.test(line)) return true;
-  if (HR_RE.test(line)) return true;
-  if (QUOTE_RE.test(line)) return true;
+  if (fc0 === '#' && ATX_RE.test(line)) return true;
+  if ((fc0 === '-' || fc0 === '*' || fc0 === '_') && HR_RE.test(line)) return true;
+  if (fc0 === '>' && QUOTE_RE.test(line)) return true;
   const ms = matchListStart(line);
   // Inside a list item, marked lets an ordered list interrupt a
   // paragraph whatever its start number; elsewhere only 1 does.
@@ -831,7 +845,8 @@ function sameListItem(a, b) {
 // and the extra 4-column strip on list-item paragraph continuations.
 function paraOpenAfter(line, wasOpen, inItem) {
   if (isBlank(line)) return false;
-  if (QUOTE_RE.test(line)) {
+  const fc = firstContentChar(line);
+  if (fc === '>' && QUOTE_RE.test(line)) {
     const g = line.indexOf('>');
     let fromCol = g + 1;
     if (line[g + 1] === ' ' || line[g + 1] === '\t') fromCol += 1;
@@ -844,7 +859,7 @@ function paraOpenAfter(line, wasOpen, inItem) {
     return !startsInterruptingBlock(line, [line], 0, inItem);
   }
   if (leadingCols(line) >= 4) return false;
-  if (scanDef([line], 0)) return false;
+  if (fc === '[' && scanDef([line], 0)) return false;
   return !startsInterruptingBlock(line, [line], 0, inItem);
 }
 
@@ -864,7 +879,8 @@ function advanceTrack(st, line, inItem) {
     st.open = false;
     return;
   }
-  const fm = FENCE_RE.exec(line);
+  const fc = firstContentChar(line);
+  const fm = (fc === '`' || fc === '~') ? FENCE_RE.exec(line) : null;
   if (fm && (fm[1][0] === '~' || !fm[2].includes('`'))) {
     st.fence = { ch: fm[1][0], len: fm[1].length };
     st.open = false;
@@ -878,10 +894,14 @@ function advanceTrack(st, line, inItem) {
 function paraOpenFlat(line, wasOpen) {
   if (isBlank(line)) return false;
   if (leadingCols(line) >= 4) return false;
-  if (isFenceStart(line) || ATX_RE.test(line) || HR_RE.test(line) || QUOTE_RE.test(line)) return false;
+  const fc = firstContentChar(line);
+  if (fc === '`' || fc === '~') { if (isFenceStart(line)) return false; }
+  else if (fc === '#' && ATX_RE.test(line)) return false;
+  else if ((fc === '-' || fc === '*' || fc === '_') && HR_RE.test(line)) return false;
+  else if (fc === '>' && QUOTE_RE.test(line)) return false;
   if (matchListStart(line)) return false;
   if (htmlBlockStart(line)) return false;
-  if (scanDef([line], 0)) return false;
+  if (fc === '[' && scanDef([line], 0)) return false;
   if (wasOpen && SETEXT_RE.test(line)) return false;
   return true;
 }
@@ -1189,12 +1209,14 @@ function decodeNumericEntities(s) {
 // (invalid ones become U+FFFD), then the result is escaped, leaving other
 // entity-shaped sequences (&name;, &#...;) untouched.
 function escapeTextNode(s) {
+  if (!s.includes('&') && !s.includes('<') && !s.includes('>') && !s.includes('"') && !s.includes("'")) return s;
   return escapeText(decodeNumericEntities(s));
 }
 
 function cleanUrl(href) {
   try {
-    return encodeURI(href).replace(/%25/g, '%');
+    const enc = encodeURI(href);
+    return href.includes('%') ? enc.replace(/%25/g, '%') : enc;
   } catch {
     return null;
   }
@@ -1208,40 +1230,62 @@ function hrefAttr(href) {
 
 // Scan an inline HTML tag/comment/etc. at the start of s (s[0] === '<').
 // Returns the raw matched string or null.
-function scanInlineHtml(s) {
-  if (s.startsWith('<!--')) {
-    if (s.startsWith('<!-->')) return '<!-->';
-    if (s.startsWith('<!--->')) return '<!--->';
-    const end = s.indexOf('-->', 4);
-    if (end === -1) return null;
-    return s.slice(0, end + 3);
+// Scan an inline HTML tag/comment/etc. at s[off]: returns its length
+// or -1. Mirrors the CommonMark tag grammar.
+function scanInlineHtml(s, off) {
+  if (s.startsWith('<!--', off)) {
+    if (s.startsWith('<!-->', off)) return 5;
+    if (s.startsWith('<!--->', off)) return 6;
+    const end = s.indexOf('-->', off + 4);
+    if (end === -1) return -1;
+    return end + 3 - off;
   }
-  if (s.startsWith('<![CDATA[')) {
-    const end = s.indexOf(']]>', 9);
-    if (end === -1) return null;
-    return s.slice(0, end + 3);
+  if (s.startsWith('<![CDATA[', off)) {
+    const end = s.indexOf(']]>', off + 9);
+    if (end === -1) return -1;
+    return end + 3 - off;
   }
-  if (s.startsWith('<?')) {
-    const end = s.indexOf('?>', 2);
-    if (end === -1) return null;
-    return s.slice(0, end + 2);
+  if (s.startsWith('<?', off)) {
+    const end = s.indexOf('?>', off + 2);
+    if (end === -1) return -1;
+    return end + 2 - off;
   }
-  let m = /^<![A-Z]+(?:[ \t][^>]*)?>/.exec(s);
-  if (m) return m[0];
-  m = /^<\/[A-Za-z][A-Za-z0-9-]*[ \t]*>/.exec(s);
-  if (m) return m[0];
-  m = /^<([A-Za-z][A-Za-z0-9-]*)/.exec(s);
-  if (!m) return null;
-  let p = m[0].length;
+  if (s.startsWith('<!', off)) {
+    let p = off + 2;
+    if (!(s[p] >= 'A' && s[p] <= 'Z')) return -1;
+    while (s[p] >= 'A' && s[p] <= 'Z') p += 1;
+    if (s[p] === ' ' || s[p] === '\t') {
+      while (p < s.length && s[p] !== '>') p += 1;
+    }
+    return s[p] === '>' ? p + 1 - off : -1;
+  }
+  const alphaAt = (idx) => { const c = s[idx]; return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); };
+  const nameAt = (idx) => { const c = s[idx]; return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c === '-'; };
+  if (s[off + 1] === '/') {
+    let p = off + 2;
+    if (!alphaAt(p)) return -1;
+    p += 1;
+    while (nameAt(p)) p += 1;
+    while (s[p] === ' ' || s[p] === '\t') p += 1;
+    return s[p] === '>' ? p + 1 - off : -1;
+  }
+  if (!alphaAt(off + 1)) return -1;
+  let p = off + 2;
+  while (nameAt(p)) p += 1;
   for (;;) {
     let ws = 0;
     while (p < s.length && (s[p] === ' ' || s[p] === '\t' || s[p] === '\n')) { p += 1; ws += 1; }
-    if (s[p] === '>') return s.slice(0, p + 1);
-    if (s[p] === '/' && s[p + 1] === '>') return s.slice(0, p + 2);
-    if (ws === 0) return null;
-    const am = /^[A-Za-z_:][A-Za-z0-9_.:-]*/.exec(s.slice(p));
-    if (!am) return null;
-    p += am[0].length;
+    if (s[p] === '>') return p + 1 - off;
+    if (s[p] === '/' && s[p + 1] === '>') return p + 2 - off;
+    if (ws === 0) return -1;
+    const attrStart = s[p];
+    if (!((attrStart >= 'A' && attrStart <= 'Z') || (attrStart >= 'a' && attrStart <= 'z') || attrStart === '_' || attrStart === ':')) return -1;
+    p += 1;
+    for (;;) {
+      const c = s[p];
+      if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c === '_' || c === '.' || c === ':' || c === '-') { p += 1; continue; }
+      break;
+    }
     let q = p;
     while (q < s.length && (s[q] === ' ' || s[q] === '\t' || s[q] === '\n')) q += 1;
     if (s[q] === '=') {
@@ -1250,12 +1294,13 @@ function scanInlineHtml(s) {
       const qc = s[q];
       if (qc === '"' || qc === "'") {
         const end = s.indexOf(qc, q + 1);
-        if (end === -1) return null;
+        if (end === -1) return -1;
         p = end + 1;
       } else {
-        const vm = /^[^\s"'=<>`]+/.exec(s.slice(q));
-        if (!vm) return null;
-        p = q + vm[0].length;
+        const vs = q;
+        while (q < s.length && !isWsChar(s[q]) && s[q] !== '"' && s[q] !== "'" && s[q] !== '=' && s[q] !== '<' && s[q] !== '>' && s[q] !== '`') q += 1;
+        if (q === vs) return -1;
+        p = q;
       }
     }
   }
@@ -1318,11 +1363,19 @@ function parseLinkDest(s, openIdx) {
 }
 
 const PUNCT_RE = /[\p{P}\p{S}]/u;
+const WS_ASCII_TAB = new Uint8Array(128);
+for (const c of [' ', '\t', '\n', '\v', '\f', '\r']) WS_ASCII_TAB[c.charCodeAt(0)] = 1;
+const PUNCT_ASCII_TAB = new Uint8Array(128);
+for (const c of '!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~') PUNCT_ASCII_TAB[c.charCodeAt(0)] = 1;
 function isWsChar(ch) {
-  return ch === undefined || /\s/.test(ch);
+  if (ch === undefined) return true;
+  const cc = ch.charCodeAt(0);
+  return cc < 128 ? WS_ASCII_TAB[cc] === 1 : /\s/.test(ch);
 }
 function isPunctChar(ch) {
-  return ch !== undefined && PUNCT_RE.test(ch);
+  if (ch === undefined) return false;
+  const cc = ch.charCodeAt(0);
+  return cc < 128 ? PUNCT_ASCII_TAB[cc] === 1 : PUNCT_RE.test(ch);
 }
 
 const TRAILING_PUNCT = new Set(['?', '!', '.', ',', ':', '*', '_', '~', ';']);
@@ -1379,92 +1432,168 @@ function trimAutolink(url) {
   }
 }
 
-// Match a bare email address at the start of s: returns the address or
-// null. The domain needs at least one dot, its labels must start and end
-// with an alphanumeric, and the address may not be immediately followed
-// by another domain-ish character (which would make it a longer,
-// invalid address rather than a valid one plus punctuation).
-function matchEmailAddress(s, underCtx) {
-  const lm = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@/.exec(s);
-  if (!lm) return null;
-  const localLen = lm[0].length;
-  const dm = /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*/.exec(s.slice(localLen));
-  if (!dm) return null;
-  const labels = dm[0].split('.');
-  const labelOk = (l) => /^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$/.test(l);
-  // Candidate domains, longest first: the full match, the full match
-  // with trailing [_-] stripped from its last label, then progressively
-  // shorter prefixes. The first label-valid candidate whose following
-  // character is a boundary wins.
-  const bases = [dm[0]];
-  const trimmedBase = dm[0].replace(/[_-]+$/, '');
-  if (trimmedBase !== dm[0] && trimmedBase.includes('.')) bases.push(trimmedBase);
-  // All label-prefixes of all bases, longest first: a longer valid
-  // domain (e.g. the trimmed full domain) must win over a shorter
-  // prefix that happens to end at a '.' boundary.
-  const candSet = new Set();
-  for (const base of bases) {
-    const bl = base.split('.');
-    for (let k = bl.length; k >= 2; k -= 1) candSet.add(bl.slice(0, k).join('.'));
+const EMAIL_LOCAL_TAB = new Uint8Array(128);
+for (const c of 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.!#$%&\'*+/=?^_`{|}~-') EMAIL_LOCAL_TAB[c.charCodeAt(0)] = 1;
+const DOMAIN_TAB = new Uint8Array(128);
+for (const c of 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-') DOMAIN_TAB[c.charCodeAt(0)] = 1;
+const ALNUM_TAB = new Uint8Array(128);
+for (const c of 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789') ALNUM_TAB[c.charCodeAt(0)] = 1;
+// Chars that block a bare email when they precede it: the email-local
+// set without '_', plus '@' (handled separately by the caller).
+const EMAIL_BLOCK_TAB = new Uint8Array(128);
+for (const c of 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.!#$%&\'*+/=?^`{|}~-') EMAIL_BLOCK_TAB[c.charCodeAt(0)] = 1;
+function tabAt(tab, s, idx) {
+  const cc = s.charCodeAt(idx);
+  return cc < 128 && tab[cc] === 1;
+}
+
+// Match a bare email address at s[start]: returns its length or 0.
+// The domain needs at least one dot, its labels must start and end
+// with an alphanumeric, and the address may not be immediately
+// followed by another domain-ish character (which would make it a
+// longer, invalid address rather than a valid one plus punctuation).
+function matchEmailAddress(s, start, delims) {
+  let p = start;
+  while (p < s.length) {
+    const cc = s.charCodeAt(p);
+    if (cc >= 128 || EMAIL_LOCAL_TAB[cc] !== 1) break;
+    p += 1;
   }
-  const candidates = [...candSet].sort((a, b) => b.length - a.length);
+  if (p === start || s[p] !== '@') return 0;
+  const domStart = p + 1;
+  // Scan the domain as dot-separated labels of [A-Za-z0-9_-].
+  const labelEnds = [];
+  let q = domStart;
+  for (;;) {
+    const ls = q;
+    while (q < s.length) {
+      const cc = s.charCodeAt(q);
+      if (cc >= 128 || DOMAIN_TAB[cc] !== 1) break;
+      q += 1;
+    }
+    if (q === ls) break;
+    labelEnds.push(q);
+    if (s[q] !== '.') break;
+    q += 1;
+  }
+  if (labelEnds.length < 2) return 0;
+  const labelOkAt = (a, b) => b - a >= 1 && tabAt(ALNUM_TAB, s, a) && tabAt(ALNUM_TAB, s, b - 1);
+  // Candidate domains, longest first: every label-prefix of the full
+  // match, and of the full match with trailing [_-] stripped from its
+  // last label. A candidate is an end position in s.
+  const candEnds = [];
+  for (let k = labelEnds.length; k >= 2; k -= 1) candEnds.push(labelEnds[k - 1]);
+  const lastEnd = labelEnds[labelEnds.length - 1];
+  const lastStart = labelEnds.length >= 2 ? labelEnds[labelEnds.length - 2] + 1 : domStart;
+  let trimEnd = lastEnd;
+  while (trimEnd > lastStart && (s[trimEnd - 1] === '_' || s[trimEnd - 1] === '-')) trimEnd -= 1;
+  if (trimEnd < lastEnd && trimEnd > lastStart) {
+    for (let k = labelEnds.length; k >= 2; k -= 1) {
+      candEnds.push(k === labelEnds.length ? trimEnd : labelEnds[k - 1]);
+    }
+  }
+  candEnds.sort((a, b) => b - a);
   let underTried = false;
-  for (const dom of candidates) {
-    if (!dom.split('.').every(labelOk)) continue;
-    const after = s[localLen + dom.length];
-    if (after !== undefined && /[A-Za-z0-9_-]/.test(after)) {
-      if (!underTried && after === '_' && underCtx) {
+  let prevEnd = -1;
+  for (const domEnd of candEnds) {
+    if (domEnd === prevEnd) continue;
+    prevEnd = domEnd;
+    // Validate every label of this candidate.
+    let ok = true;
+    let ls = domStart;
+    for (let k = 0; k < labelEnds.length; k += 1) {
+      const le = k === labelEnds.length - 1 && domEnd < labelEnds[k] ? domEnd : labelEnds[k];
+      if (le > domEnd) break;
+      if (!labelOkAt(ls, le)) { ok = false; break; }
+      if (le === domEnd) break;
+      ls = labelEnds[k] + 1;
+    }
+    if (!ok) continue;
+    const after = s[domEnd];
+    if (after !== undefined && tabAt(DOMAIN_TAB, s, domEnd)) {
+      if (!underTried && after === '_' && delims) {
         underTried = true;
         let m = 0;
-        while (s[localLen + dom.length + m] === '_') m += 1;
-        if (m >= 1 && underCtx(m)) return s.slice(0, localLen) + dom;
+        while (s[domEnd + m] === '_') m += 1;
+        if (m >= 1 && delims.some((e) => e.char === '_' && e.len === m && e.canOpen)) return domEnd - start;
       }
       continue;
     }
-    return s.slice(0, localLen) + dom;
+    return domEnd - start;
   }
-  return null;
+  return 0;
 }
 
 // Try a GFM extended autolink at s[i]: returns {raw, href} or null.
 // opts.delims: delimiter runs scanned so far (for the __ email rule);
 // opts.inBracket: inside an open '[' label, where a bare autolink run
 // must stop at a bracket (marked lexes the label atomically).
-function matchAutolink(s, i, prevCh, opts) {
-  const rest = s.slice(i);
-  const boundary = prevCh === undefined || isWsChar(prevCh) || isPunctChar(prevCh);
-  const underCtx = opts && opts.delims ? (m) => opts.delims.some((e) => e.char === '_' && e.len === m && e.canOpen) : null;
-  const capRun = (run) => {
-    if (!opts || !opts.inBracket) return run;
-    const cut = run.search(/[\[\]]/);
-    return cut === -1 ? run : run.slice(0, cut);
-  };
-  let m = /^(?:https?|ftp):\/\/[^\s<>]+/i.exec(rest);
-  if (m && boundary) {
-    const raw = trimAutolink(cutUnclosedGroup(capRun(m[0])));
-    if (raw.length <= m[0].indexOf('://') + 3) return null;
-    return { raw, href: raw };
+function matchSchemeAt(s, i) {
+  // Returns the length of 'http://', 'https://' or 'ftp://' at s[i]
+  // (case-insensitive), or 0.
+  const lc = (ch) => (ch >= 'A' && ch <= 'Z' ? ch.toLowerCase() : ch);
+  const c0 = s[i];
+  if (c0 === 'h' || c0 === 'H') {
+    if (lc(s[i + 1]) === 't' && lc(s[i + 2]) === 't' && lc(s[i + 3]) === 'p') {
+      if (lc(s[i + 4]) === 's' && s[i + 5] === ':' && s[i + 6] === '/' && s[i + 7] === '/') return 8;
+      if (s[i + 4] === ':' && s[i + 5] === '/' && s[i + 6] === '/') return 7;
+    }
+  } else if (c0 === 'f' || c0 === 'F') {
+    if (lc(s[i + 1]) === 't' && lc(s[i + 2]) === 'p' && s[i + 3] === ':' && s[i + 4] === '/' && s[i + 5] === '/') return 6;
   }
-  if ((rest.startsWith('www.') || rest.startsWith('WWW.')) && boundary) {
-    m = /^www\.[^\s<>]+/i.exec(rest);
-    if (m) {
-      const capped = capRun(m[0]);
-      if (capped.includes('.', 4)) {
-        const raw = trimAutolink(cutUnclosedGroup(capped));
-        if (raw.length > 4) return { raw, href: 'http://' + raw };
+  return 0;
+}
+
+function scanRunWs(s, from) {
+  let j = from;
+  while (j < s.length && !isWsChar(s[j]) && s[j] !== '<' && s[j] !== '>') j += 1;
+  return j;
+}
+
+function capBracketRun(run, inBracket) {
+  if (!inBracket) return run;
+  const cut = run.search(/[\[\]]/);
+  return cut === -1 ? run : run.slice(0, cut);
+}
+
+function matchAutolink(s, i, prevCh, delims, inBracket) {
+  const pcc = prevCh === undefined ? -1 : prevCh.charCodeAt(0);
+  const boundary = prevCh === undefined || (pcc < 128 ? (WS_ASCII_TAB[pcc] === 1 || PUNCT_ASCII_TAB[pcc] === 1) : (isWsChar(prevCh) || isPunctChar(prevCh)));
+  if (boundary) {
+    const schemeLen = matchSchemeAt(s, i);
+    if (schemeLen > 0) {
+      const end = scanRunWs(s, i);
+      if (end > i + schemeLen) {
+        const raw = trimAutolink(cutUnclosedGroup(capBracketRun(s.slice(i, end), inBracket)));
+        if (raw.length <= schemeLen) return null;
+        return { raw, href: raw };
       }
     }
-    return null;
-  }
-  if (boundary) {
-    const sm = /^(mailto:|xmpp:)/i.exec(rest);
-    if (sm) {
-      const em = matchEmailAddress(rest.slice(sm[0].length), underCtx);
-      if (!em) return null;
-      let raw = sm[0] + em;
-      if (sm[1].toLowerCase() === 'xmpp:') {
-        const rm = /^\/[^/\s<>]+/.exec(rest.slice(sm[0].length + em.length));
-        if (rm) raw += rm[0];
+    if (s.startsWith('www.', i) || s.startsWith('WWW.', i)) {
+      if (scanRunWs(s, i) > i + 4) {
+        const capped = capBracketRun(s.slice(i, scanRunWs(s, i)), inBracket);
+        if (capped.includes('.', 4)) {
+          const raw = trimAutolink(cutUnclosedGroup(capped));
+          if (raw.length > 4) return { raw, href: 'http://' + raw };
+        }
+      }
+      return null;
+    }
+    const lcAt = (idx, ch) => { const c = s[idx]; return c === ch || (c >= 'A' && c <= 'Z' && c.toLowerCase() === ch); };
+    const schemeMail = (lcAt(i, 'm') && lcAt(i + 1, 'a') && lcAt(i + 2, 'i') && lcAt(i + 3, 'l') && lcAt(i + 4, 't') && lcAt(i + 5, 'o') && s[i + 6] === ':') ? 7
+      : (lcAt(i, 'x') && lcAt(i + 1, 'm') && lcAt(i + 2, 'p') && lcAt(i + 3, 'p') && s[i + 4] === ':') ? 5 : 0;
+    if (schemeMail > 0) {
+      const emLen = matchEmailAddress(s, i + schemeMail, delims);
+      if (!emLen) return null;
+      let raw = s.slice(i, i + schemeMail + emLen);
+      if (schemeMail === 5) {
+        let j = i + schemeMail + emLen;
+        if (s[j] === '/') {
+          j += 1;
+          const rs = j;
+          while (j < s.length && s[j] !== '/' && !isWsChar(s[j]) && s[j] !== '<' && s[j] !== '>') j += 1;
+          if (j > rs) raw += s.slice(rs - 1, j);
+        }
       }
       return { raw: trimAutolink(raw), href: raw };
     }
@@ -1472,15 +1601,21 @@ function matchAutolink(s, i, prevCh, opts) {
   // A bare email may not be preceded by an email character (it would
   // be the tail of a longer address) — except a '_' run that starts a
   // word, which marked has already claimed as an emphasis delimiter.
-  let emailBlocked = prevCh !== undefined && /[A-Za-z0-9.!#$%&'*+\/=?^`{|}~@-]/.test(prevCh);
+  let emailBlocked = (pcc >= 0 && pcc < 128 && EMAIL_BLOCK_TAB[pcc] === 1) || prevCh === '@';
   if (!emailBlocked && prevCh === '_') {
     let j = i - 1;
     while (j >= 0 && s[j] === '_') j -= 1;
-    if (j >= 0 && /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(s[j])) emailBlocked = true;
+    if (j >= 0) {
+      const cc = s.charCodeAt(j);
+      if (cc < 128 && EMAIL_LOCAL_TAB[cc] === 1) emailBlocked = true;
+    }
   }
   if (!emailBlocked) {
-    const em = matchEmailAddress(rest, underCtx);
-    if (em) return { raw: em, href: 'mailto:' + em };
+    const emLen = matchEmailAddress(s, i, delims);
+    if (emLen) {
+      const em = s.slice(i, i + emLen);
+      return { raw: em, href: 'mailto:' + em };
+    }
   }
   return null;
 }
@@ -1511,6 +1646,7 @@ function backtickRuns(text) {
 // run inside the label. A trailing run of length >= 2 at the very
 // end of the label is absorbed.
 function labelIsValid(label) {
+  if (!label.includes('`')) return true;
   const runs = backtickRuns(label);
   if (runs.length % 2 === 0) return true;
   const last = runs[runs.length - 1];
@@ -1748,6 +1884,10 @@ function renderInline(src, ctx, inLink) {
   };
 
   const n = src.length;
+  // Run lengths known to have no closing run later in this text: a
+  // failed code-span search scans to the end, so any later run of the
+  // same length can be emitted as text without searching again.
+  const deadRuns = new Set();
   let i = 0;
   while (i < n) {
     const c = src[i];
@@ -1790,21 +1930,24 @@ function renderInline(src, ctx, inLink) {
       let j = i + run;
       let found = -1;
       let lstate = lspanAfter;
-      while (j < n) {
-        if (src[j] === '`') {
-          let m2 = 1;
-          while (src[j + m2] === '`') m2 += 1;
-          if (inLabel) {
-            if (lstate === 0) lstate = m2;
-            else if (m2 <= lstate) lstate = 0;
-          }
-          if (m2 === run) { found = j; break; }
-          j += m2;
-        } else if (src[j] === ']' && inLabel && lstate === 0) {
-          // The label ends before any span closes: the code span
-          // search is confined to the label.
-          break;
-        } else j += 1;
+      if (!deadRuns.has(run)) {
+        while (j < n) {
+          if (src[j] === '`') {
+            let m2 = 1;
+            while (src[j + m2] === '`') m2 += 1;
+            if (inLabel) {
+              if (lstate === 0) lstate = m2;
+              else if (m2 <= lstate) lstate = 0;
+            }
+            if (m2 === run) { found = j; break; }
+            j += m2;
+          } else if (src[j] === ']' && inLabel && lstate === 0) {
+            // The label ends before any span closes: the code span
+            // search is confined to the label.
+            break;
+          } else j += 1;
+        }
+        if (found === -1 && j >= n) deadRuns.add(run);
       }
       if (found === -1) {
         if (inLabel) topBr.lspan = lspanAfter;
@@ -1823,30 +1966,69 @@ function renderInline(src, ctx, inLink) {
       continue;
     }
     if (c === '<') {
-      const rest = src.slice(i);
-      let m = /^<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>/.exec(rest);
-      if (m) {
-        const attr = hrefAttr(m[1]);
-        flushText();
-        appendNode({ kind: 'raw', text: '<a href="' + (attr === null ? '' : attr) + '">' + escapeFull(m[1]) + '</a>', altText: m[1] });
-        i += m[0].length;
-        continue;
+      // Angle autolink with a scheme: <scheme:...>
+      {
+        let p = i + 1;
+        const a0 = src[p];
+        if (a0 !== undefined && ((a0 >= 'A' && a0 <= 'Z') || (a0 >= 'a' && a0 <= 'z'))) {
+          p += 1;
+          const ss = p;
+          while (p < n) {
+            const c2 = src[p];
+            if ((c2 >= 'A' && c2 <= 'Z') || (c2 >= 'a' && c2 <= 'z') || (c2 >= '0' && c2 <= '9') || c2 === '+' || c2 === '.' || c2 === '-') { p += 1; continue; }
+            break;
+          }
+          if (p - ss >= 1 && p - (i + 1) <= 32 && src[p] === ':') {
+            let q = p + 1;
+            while (q < n && src[q] !== '<' && src[q] !== '>' && !isWsChar(src[q])) q += 1;
+            if (src[q] === '>') {
+              const text = src.slice(i + 1, q);
+              const attr = hrefAttr(text);
+              flushText();
+              appendNode({ kind: 'raw', text: '<a href="' + (attr === null ? '' : attr) + '">' + escapeFull(text) + '</a>', altText: text });
+              i = q + 1;
+              continue;
+            }
+          }
+        }
       }
-      m = /^<([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)>/.exec(rest);
-      if (m) {
-        flushText();
-        appendNode({ kind: 'raw', text: '<a href="mailto:' + escapeText(m[1]) + '">' + escapeText(m[1]) + '</a>', altText: m[1] });
-        i += m[0].length;
-        continue;
+      // Angle autolink with an email address: <user@host.tld>
+      {
+        let p = i + 1;
+        while (p < n && tabAt(EMAIL_LOCAL_TAB, src, p)) p += 1;
+        if (p > i + 1 && src[p] === '@') {
+          let q = p + 1;
+          let dots = 0;
+          let ok = true;
+          for (;;) {
+            const ls = q;
+            while (q < n) {
+              const c2 = src[q];
+              if ((c2 >= 'A' && c2 <= 'Z') || (c2 >= 'a' && c2 <= 'z') || (c2 >= '0' && c2 <= '9') || c2 === '-') { q += 1; continue; }
+              break;
+            }
+            if (q === ls) { ok = false; break; }
+            if (src[q] === '.') { dots += 1; q += 1; continue; }
+            break;
+          }
+          if (ok && dots >= 1 && src[q] === '>') {
+            const text = src.slice(i + 1, q);
+            flushText();
+            appendNode({ kind: 'raw', text: '<a href="mailto:' + escapeText(text) + '">' + escapeText(text) + '</a>', altText: text });
+            i = q + 1;
+            continue;
+          }
+        }
       }
-      const html = scanInlineHtml(rest);
-      if (html !== null) {
+      const htmlLen = scanInlineHtml(src, i);
+      if (htmlLen !== -1) {
+        const html = src.slice(i, i + htmlLen);
         pushRaw(html);
         // marked leaks its inLink state across inline runs: an <a …>
         // tag suppresses bare autolinks until an exact </a> appears.
         if (/^<a /i.test(html)) ctx.state.inLink = true;
         else if (/^<\/a>$/i.test(html)) ctx.state.inLink = false;
-        i += html.length;
+        i += htmlLen;
         continue;
       }
       textBuf += '<';
@@ -1908,20 +2090,28 @@ function renderInline(src, ctx, inLink) {
       continue;
     }
     if (c === ' ') {
-      const m = /^ {2,}\n/.exec(src.slice(i));
-      if (m) {
-        pushRaw('<br>');
-        i += m[0].length;
-        while (src[i] === ' ' || src[i] === '\t') i += 1; // next line's indent is dropped
+      if (src[i + 1] === ' ') {
+        let j = i + 1;
+        while (src[j] === ' ') j += 1;
+        if (src[j] === '\n') {
+          // Two or more spaces before a newline: a hard break, and
+          // the next line's leading spaces/tabs are dropped.
+          pushRaw('<br>');
+          i = j + 1;
+          while (src[i] === ' ' || src[i] === '\t') i += 1;
+          continue;
+        }
+        textBuf += src.slice(i, j);
+        i = j;
         continue;
       }
       textBuf += ' ';
       i += 1;
       continue;
     }
-    if (!inLink && !ctx.state.inLink && (c === 'h' || c === 'H' || c === 'w' || c === 'W' || c === 'f' || c === 'F' || /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(c))) {
+    if (!inLink && !ctx.state.inLink && tabAt(EMAIL_LOCAL_TAB, src, i)) {
       const prevCh = i > 0 ? src[i - 1] : undefined;
-      const al = matchAutolink(src, i, prevCh, { delims, inBracket: brackets.length > 0 && brackets[brackets.length - 1].active });
+      const al = matchAutolink(src, i, prevCh, delims, brackets.length > 0 && brackets[brackets.length - 1].active);
       if (al) {
         const attr = hrefAttr(al.href);
         flushText();
@@ -1929,9 +2119,37 @@ function renderInline(src, ctx, inLink) {
         i += al.raw.length;
         continue;
       }
+      // No autolink starts here. Consume the following run of plain
+      // word characters in bulk: an autolink cannot start inside it,
+      // except right after a punctuation character (a scheme, www or
+      // mailto start) — the run stops before such a position, and at
+      // characters with their own branch above.
+      let j = i + 1;
+      while (j < n && tabAt(EMAIL_LOCAL_TAB, src, j)) {
+        const cj = src[j];
+        if (cj === '*' || cj === '_' || cj === '~' || cj === '`') break;
+        if ((cj === 'h' || cj === 'H' || cj === 'f' || cj === 'F' || cj === 'w' || cj === 'W' || cj === 'm' || cj === 'M' || cj === 'x' || cj === 'X') && isPunctChar(src[j - 1])) break;
+        j += 1;
+      }
+      textBuf += src.slice(i, j);
+      i = j;
+      continue;
     }
-    textBuf += c;
-    i += 1;
+    // A plain character with no branch of its own: consume a run of
+    // such characters at once (not a branch character, and unable to
+    // start an autolink).
+    {
+      let j = i + 1;
+      while (j < n) {
+        const cc = src.charCodeAt(j);
+        if (cc < 128 && EMAIL_LOCAL_TAB[cc] === 1) break;
+        const cj = src[j];
+        if (cj === '\\' || cj === '<' || cj === '[' || cj === ']' || cj === ' ') break;
+        j += 1;
+      }
+      textBuf += src.slice(i, j);
+      i = j;
+    }
   }
   flushText();
 
