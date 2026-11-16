@@ -543,7 +543,9 @@ function lexBlocks(lines, ctx, prot) {
           closed = true;
           break;
         }
-        body.push(indent > 0 ? stripCols(cl, indent) : cl);
+        // Marked dedents backtick-fence content by the opener's
+        // indent, but leaves tilde-fence content untouched.
+        body.push(ch === '`' && indent > 0 ? stripCols(cl, indent) : cl);
         j += 1;
       }
       if (body.length && body[body.length - 1] === '') body.pop();
@@ -675,10 +677,14 @@ function lexHtmlBlock(lines, i, hb, ctx) {
   }
   // Marked keeps the newline after the block's last line unless the block
   // was terminated by a blank line (or the source simply ends there).
+  // Blank-terminated kinds (block/tag) treat any whitespace-only line as
+  // the terminator; closer-terminated kinds only lose the newline when
+  // the following line is completely empty.
   let text = body.join('\n');
   const lastIdx = j - 1;
   if (lastIdx < lines.length - 1) {
-    if (!isBlank(lines[j])) text += '\n';
+    const closerKind = hb.kind !== 'block' && hb.kind !== 'tag';
+    if (closerKind ? lines[j] !== '' : !isBlank(lines[j])) text += '\n';
   } else if (ctx.srcEndsNl) {
     text += '\n';
   }
@@ -1535,12 +1541,28 @@ function renderInline(src, ctx, inLink) {
     let title = null;
     let consumed = -1;
     let refAttempted = false;
+    let parenComplete = false;
     if (src[closeIdx + 1] === '(') {
       const pd = parseLinkDest(src, closeIdx + 1);
       if (pd) {
         href = pd.href;
         title = pd.title;
         consumed = pd.end;
+      } else {
+        // Did the parenthesized group at least close? marked matches
+        // the [...](...) shape first and validates the destination
+        // second; when validation fails on a complete group, the label
+        // renders with its emphasis muted (code spans still form).
+        let depth = 1;
+        for (let j = closeIdx + 2; j < n; j += 1) {
+          const cj = src[j];
+          if (cj === '\\') { j += 1; continue; }
+          if (cj === '(') depth += 1;
+          else if (cj === ')') {
+            depth -= 1;
+            if (depth === 0) { parenComplete = true; break; }
+          }
+        }
       }
     }
     if (consumed === -1 && src[closeIdx + 1] === '[') {
@@ -1572,6 +1594,12 @@ function renderInline(src, ctx, inLink) {
       }
     }
     if (consumed === -1) {
+      if (parenComplete) {
+        for (let k = opener.delimIdx; k < delims.length; k += 1) {
+          delims[k].canOpen = false;
+          delims[k].canClose = false;
+        }
+      }
       popBracket();
       return -1;
     }
