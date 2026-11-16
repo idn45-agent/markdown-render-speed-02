@@ -1523,6 +1523,22 @@ function renderInline(src, ctx, inLink) {
     }
     return popped;
   };
+  // Does the '(' at openIdx start a group that closes (depth returns
+  // to 0) somewhere in the rest of the source?
+  const parenGroupComplete = (openIdx) => {
+    let depth = 1;
+    for (let j = openIdx + 1; j < src.length; j += 1) {
+      const cj = src[j];
+      if (cj === '\\') { j += 1; continue; }
+      if (cj === '(') depth += 1;
+      else if (cj === ')') {
+        depth -= 1;
+        if (depth === 0) return true;
+      }
+    }
+    return false;
+  };
+
   const closeBracket = (closeIdx) => {
     if (!brackets.length) return -1;
     const opener = brackets[brackets.length - 1];
@@ -1532,7 +1548,14 @@ function renderInline(src, ctx, inLink) {
     }
     if (!labelIsValid(src.slice(opener.contentStart, closeIdx))) {
       // marked's label extraction rejects this label (see
-      // labelIsValid), so the ']' stays literal text.
+      // labelIsValid), so the ']' stays literal text. A complete
+      // (...)-group after it still mutes the label's emphasis.
+      if (src[closeIdx + 1] === '(' && parenGroupComplete(closeIdx + 1)) {
+        for (let k = opener.delimIdx; k < delims.length; k += 1) {
+          delims[k].canOpen = false;
+          delims[k].canClose = false;
+        }
+      }
       popBracket();
       return -1;
     }
@@ -1553,16 +1576,7 @@ function renderInline(src, ctx, inLink) {
         // the [...](...) shape first and validates the destination
         // second; when validation fails on a complete group, the label
         // renders with its emphasis muted (code spans still form).
-        let depth = 1;
-        for (let j = closeIdx + 2; j < n; j += 1) {
-          const cj = src[j];
-          if (cj === '\\') { j += 1; continue; }
-          if (cj === '(') depth += 1;
-          else if (cj === ')') {
-            depth -= 1;
-            if (depth === 0) { parenComplete = true; break; }
-          }
-        }
+        parenComplete = parenGroupComplete(closeIdx + 1);
       }
     }
     if (consumed === -1 && src[closeIdx + 1] === '[') {
@@ -1607,12 +1621,16 @@ function renderInline(src, ctx, inLink) {
     const inside = delims.splice(opener.delimIdx);
     processDelims(inside);
     if (!opener.isImage) {
-      // Bare autolinks do not form inside link text: unwrap them.
-      let nd = opener.node.next;
-      while (nd) {
-        if (nd.kind === 'autolink') { nd.kind = 'text'; nd.text = nd.rawText; }
-        nd = nd.next;
-      }
+      // Bare autolinks do not form inside link text: unwrap them,
+      // including ones nested inside emphasis wraps.
+      const unwrap = (nd) => {
+        while (nd) {
+          if (nd.kind === 'autolink') { nd.kind = 'text'; nd.text = nd.rawText; }
+          if (nd.inner) unwrap(nd.inner);
+          nd = nd.next;
+        }
+      };
+      unwrap(opener.node.next);
     }
     const innerHead = opener.node.next;
     if (innerHead) innerHead.prev = null;
