@@ -1503,15 +1503,27 @@ function renderInline(src, ctx, inLink) {
   {
     // Collect the backtick runs first: an opener that finds no
     // exact-length closing run is simply skipped, and pairing resumes
-    // at the next run (it does not swallow the rest of the text).
+    // at the next run (it does not swallow the rest of the text). A
+    // backslash-escaped run can close a pair (marked's span search
+    // does not skip escapes) but never open one.
     const runs = [];
     let k = 0;
     while (k < src.length) {
-      if (src[k] === '\\') { k += 2; continue; }
+      if (src[k] === '\\') {
+        if (src[k + 1] === '`') {
+          let run = 1;
+          while (src[k + 1 + run] === '`') run += 1;
+          runs.push([k + 1, run, true]);
+          k += 1 + run;
+          continue;
+        }
+        k += 2;
+        continue;
+      }
       if (src[k] === '`') {
         let run = 1;
         while (src[k + run] === '`') run += 1;
-        runs.push([k, run]);
+        runs.push([k, run, false]);
         k += run;
         continue;
       }
@@ -1519,6 +1531,7 @@ function renderInline(src, ctx, inLink) {
     }
     let ri = 0;
     while (ri < runs.length) {
+      if (runs[ri][2]) { ri += 1; continue; }
       const [openPos, openLen] = runs[ri];
       let rj = ri + 1;
       while (rj < runs.length && runs[rj][1] !== openLen) rj += 1;
